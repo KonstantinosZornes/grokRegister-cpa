@@ -19,5 +19,11 @@
   "defaultDomains": "example.com",
   "email_provider": "cloudflare",
   "yyds_api_key": "",
-  "yyds_jwt": ""
+  "yyds_jwt": "",
+  "outlook_email_plus_api_base": "",
+  "outlook_email_plus_api_key": "",
+  "outlook_email_plus_caller_id": "grok-register",
+  "outlook_email_plus_pool_provider": "",
+  "outlook_email_plus_project_key": "",
+  "outlook_email_plus_email_domain": ""
 }

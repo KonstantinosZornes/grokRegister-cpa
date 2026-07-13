@@ -32,6 +32,7 @@
 - GUI + CLI 两种运行方式（CLI 仍会打开浏览器完成注册页）
 - Chromium/Chrome 自动处理 Turnstile
 - DuckMail / YYDS / Cloudflare 临时邮箱
+- outlookEmailPlus 邮箱池接口：领取、等待验证码、回传结果
 - 注册后可选开启 NSFW
 - 页面卡住重试、验证码失败换邮箱、浏览器重启与内存清理
 - CLI：一次 `Ctrl+C` 安全停止，清理阶段不刷 traceback；再按一次强制中断
@@ -62,7 +63,7 @@ cp config.example.json config.json
 | `cpa_auth_dir` | 本地 CPA auth 目录；写入 `xai-<email>.json`，可留空 |
 | `cpa_remote_url` | 远程 CPA 地址，如 `http://你的CPA地址:8317` |
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
-| `email_provider` | `duckmail` / `yyds` / `cloudflare` |
+| `email_provider` | `duckmail` / `yyds` / `cloudflare` / `outlook_email_plus` |
 | `register_count` | 目标注册数量 |
 | `proxy` | 代理；device-flow 换 token 也走此代理 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
@@ -72,6 +73,12 @@ cp config.example.json config.json
 | `cloudflare_custom_auth` | Worker 全局密码（`PASSWORDS`），注入 `x-custom-auth` |
 | `cloudflare_path_*` | domains / accounts / token / messages 路径 |
 | `defaultDomains` | Cloudflare 默认收信域名 |
+| `outlook_email_plus_api_base` | outlookEmailPlus 服务地址（`/api/external/*` 接口根） |
+| `outlook_email_plus_api_key` | outlookEmailPlus `X-API-Key` |
+| `outlook_email_plus_caller_id` | 调用方节点标识，默认 `grok-register` |
+| `outlook_email_plus_pool_provider` | 池筛选：`outlook` / `imap` / `custom` / `cloudflare_temp_mail`，留空不筛选 |
+| `outlook_email_plus_project_key` | 长期邮箱项目复用标识 |
+| `outlook_email_plus_email_domain` | `provider=cloudflare_temp_mail` 时指定动态创建邮箱域名 |
 
 ### Cloudflare 邮箱（默认匿名）
 
@@ -115,6 +122,38 @@ Worker 若配置了全局 `PASSWORDS`，再加：
 ```json
 { "cloudflare_custom_auth": "你的全局访问密码" }
 ```
+
+### outlookEmailPlus 邮箱池接入
+
+将 `email_provider` 设为 `outlook_email_plus` 即可接入自建的 outlookEmailPlus 服务。该服务对外暴露 `/api/external/*` 接口（`X-API-Key` 鉴权），程序会按推荐流程完成池交互：
+
+1. `POST /api/external/pool/claim-random` 领取一个邮箱
+2. `GET /api/external/wait-message` 轮询"请求发起后才到达"的新邮件，并本地提取 `xAI` 验证码
+3. 注册成功 → `POST /api/external/pool/claim-complete`（`result=success`）
+4. 邮箱已被领取但中途放弃 / 失败 → `POST /api/external/pool/claim-release`，让邮箱尽快回到池的 cooldown
+
+```json
+{
+  "email_provider": "outlook_email_plus",
+  "outlook_email_plus_api_base": "https://你的-outlookEmailPlus-域名",
+  "outlook_email_plus_api_key": "你的 X-API-Key",
+  "outlook_email_plus_caller_id": "grok-register",
+  "outlook_email_plus_pool_provider": "",
+  "outlook_email_plus_project_key": "",
+  "outlook_email_plus_email_domain": ""
+}
+```
+
+注册前可用自检子命令验证池连通性：
+
+```bash
+python grok_register_ttk.py test-outlook-email-plus
+```
+
+说明：
+
+- 注册流程内每个邮箱都会显式回写 `claim-complete` 或 `claim-release`；若进程被强制结束，未获回写的领取将按 outlookEmailPlus 自身的租约超时机制自动转入 cooldown。
+- `dev_token` 在该 provider 下是一段包含 `account_id / claim_token / caller_id / task_id` 的 JSON 串，仅用于回写释放/完成，不用于邮箱鉴权（邮箱读取由 `X-API-Key` + `email` 完成）。
 
 ## CPA 自动入库
 
@@ -182,6 +221,12 @@ python grok_register_ttk.py cli
 
 提示后输入 `start`。  
 `Ctrl+C` 一次：当前账号收尾后停止；清理浏览器时不会因二次中断刷 traceback。再按一次强制退出。
+
+自检 outlookEmailPlus 池连通性：
+
+```bash
+python grok_register_ttk.py test-outlook-email-plus
+```
 
 ### GUI
 
