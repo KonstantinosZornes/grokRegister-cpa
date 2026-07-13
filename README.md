@@ -21,7 +21,7 @@
 
 ```text
 打开注册页 → 创建临时邮箱 → 收验证码 → 填资料 / 过人机验证
-   → 拿到 SSO cookie → device-flow 换 OAuth token
+   → 拿到 SSO cookie → 授权码流程换 OAuth token（带 referrer=grok-build）
    → 本地写入 cpa_auth_dir  和/或  POST 远程 CPA Management API
    → CPA 热加载，立即可用
 ```
@@ -41,7 +41,7 @@
 - Python 3.9+
 - Google Chrome 或 Chromium
 - 可用的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)
-- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（device-flow 换 token 需要）
+- 能访问注册页、临时邮箱 API、`auth.x.ai` 的网络（授权码流程换 token 需要）
 
 ## 安装
 
@@ -64,7 +64,7 @@ cp config.example.json config.json
 | `cpa_management_key` | 远程 CPA 管理密钥（`remote-management.secret-key` 明文） |
 | `email_provider` | `duckmail` / `yyds` / `cloudflare` |
 | `register_count` | 目标注册数量 |
-| `proxy` | 代理；device-flow 换 token 也走此代理 |
+| `proxy` | 代理；换 token 的 OAuth 请求也走此代理 |
 | `enable_nsfw` | 注册后是否尝试开启 NSFW |
 | `cloudflare_api_base` | Cloudflare 临时邮箱 API 根地址 |
 | `cloudflare_api_key` | 默认匿名模式留空；admin 模式填 `ADMIN_PASSWORD` |
@@ -120,7 +120,7 @@ Worker 若配置了全局 `PASSWORDS`，再加：
 
 SSO 不是 CPA 凭据。程序会：
 
-1. 用 SSO 走 device-flow 向 `auth.x.ai` 换 `access_token` / `refresh_token`
+1. 用 SSO 走授权码流程（`referrer=grok-build`）向 `auth.x.ai` 换 `access_token` / `refresh_token`
 2. 组装 `type=xai` 扁平 auth（`cli-chat-proxy.grok.com`）
 3. 本地：`cpa_auth_dir` → `xai-<email>.json`（CPA 热加载）
 4. 远程：`POST {cpa_remote_url}/v0/management/auth-files?name=...`（需管理密钥）
@@ -171,6 +171,17 @@ python sso_to_auth_json.py --sso-cookie 'eyJ...' \
 ```
 
 `sso_list.txt`：一行一个 SSO，或 `邮箱----密码----sso`。
+
+### 为什么必须用授权码流程
+
+这是本项目区别于普通 SSO→token 脚本的关键，踩过坑后固化下来：
+
+- **SSO 不能直接喂给 CPA。** CPA 走 OAuth，需要 `access_token` / `refresh_token`，SSO cookie 只是换 token 的入场券。
+- **必须带 `referrer=grok-build`。** xAI 后端要求 access_token 携带 `referrer=grok-build` claim，否则 grok build 通道（`cli-chat-proxy.grok.com`）拒绝，调用 chat 时报 `permission-denied / Access to the chat endpoint is denied`。早期用 device flow 换的 token **不带**这个 claim，会全部失效。
+- **解法：授权码流程（Authorization Code + PKCE）。** 在 `/oauth2/authorize` 和 consent 提交两处注入 `referrer=grok-build`，换出的 token 才带此 claim。程序换完会自动校验，日志显示 `access_token 已带 referrer=grok-build`。
+- **base_url 必须是 `cli-chat-proxy.grok.com/v1`。** 写入的 auth 记录 `base_url` 指向 grok build 免费通道；若为空，CPA 会回退到计费通道 `api.x.ai/v1`，同样触发 `permission-denied`。
+
+如果 CPA 里已有旧的失效号（`base_url=api.x.ai/v1` 或 `referrer=None`），用本节的独立转换脚本以相同邮箱重新生成一遍覆盖即可（文件名按 `xai-<email>.json` 命名，会原地覆盖）。
 
 ## 运行
 
