@@ -952,15 +952,22 @@ def outlook_email_plus_get_oai_code(
 
     wait-message 的同步语义：只返回请求发起后才出现的匹配邮件，
     因此天然规避了“拿到旧邮件里的过期验证码”这一风险。
+
+    兜底：wait-message 的 sync 模式存在时序窗口——邮件若在两次请求
+    之间的空隙到达，会永远错过。因此每轮 wait-message 返回 404 后，
+    再用 GET /api/external/messages 拉取该邮箱的邮件列表，检查是否有
+    timestamp >= started_at 的新邮件，有则提取验证码。
     """
     api_base = get_outlook_email_plus_api_base()
     if not api_base:
         raise Exception("outlookEmailPlus API Base 未配置")
     headers = outlook_email_plus_build_headers()
+    started_at = time.time() - 5  # 5 秒缓冲，吸收时钟漂移
     deadline = time.time() + timeout
     next_resend_at = time.time() + 35
     wait_seconds = 25
     round_no = 0
+    checked_msg_ids = set()  # 已通过兜底检查过的 message ID
     if log_callback:
         log_callback(
             f"[Debug] outlookEmailPlus 拉取验证码开始: email={email} "
@@ -1025,7 +1032,12 @@ def outlook_email_plus_get_oai_code(
                 f"status={resp.status_code} len={len(resp.text or '')}"
             )
         if resp.status_code == 404:
-            # 服务端本轮未等到新邮件，继续下一轮
+            # 服务端本轮未等到新邮件；用 message-list 兜底检查
+            fallback_code = _outlook_email_plus_fallback_list_messages(
+                email, started_at, headers, round_no, checked_msg_ids, log_callback
+            )
+            if fallback_code:
+                return fallback_code
             if log_callback:
                 log_callback(
                     f"[Debug] outlookEmailPlus 第{round_no}轮 本轮未等到新邮件(404)，继续下一轮"
@@ -1055,6 +1067,12 @@ def outlook_email_plus_get_oai_code(
                 log_callback(
                     f"[Debug] outlookEmailPlus 第{round_no}轮 wait-message 失败: {code} {data.get('message')}"
                 )
+            # 非 404 的失败也走兜底
+            fallback_code = _outlook_email_plus_fallback_list_messages(
+                email, started_at, headers, round_no, checked_msg_ids, log_callback
+            )
+            if fallback_code:
+                return fallback_code
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
 
@@ -1098,6 +1116,90 @@ def outlook_email_plus_get_oai_code(
             f"[Debug] outlookEmailPlus 拉取验证码结束: 共{round_no}轮 超时={timeout}s 未收到验证码"
         )
     raise Exception(f"outlookEmailPlus 在 {timeout}s 内未收到验证码邮件")
+
+
+def _outlook_email_plus_fallback_list_messages(
+    email, started_at, headers, round_no, checked_msg_ids, log_callback=None
+):
+    """wait-message 漏检时的兜底：GET /api/external/messages 拉取邮件列表，
+    检查 timestamp >= started_at 的新邮件并提取验证码。
+
+    返回提取到的验证码字符串，或 None。
+    """
+    try:
+        resp = http_get(
+            _outlook_email_plus_external_url("/api/external/messages"),
+            headers=headers,
+            params={"email": email, "limit": "20"},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            if log_callback:
+                log_callback(
+                    f"[Debug] outlookEmailPlus 第{round_no}轮 兜底 messages-list 失败 "
+                    f"HTTP {resp.status_code}"
+                )
+            return None
+        data = resp.json()
+        if not data.get("success", True) and data.get("code"):
+            if log_callback:
+                log_callback(
+                    f"[Debug] outlookEmailPlus 第{round_no}轮 兜底 messages-list "
+                    f"code={data.get('code')} msg={data.get('message')}"
+                )
+            return None
+        emails = (data.get("data") or {}).get("emails") or []
+        new_msgs = []
+        for m in emails:
+            msg_id = str(m.get("id") or "")
+            ts = m.get("timestamp") or 0
+            try:
+                ts = float(ts)
+            except Exception:
+                ts = 0
+            if msg_id and msg_id in checked_msg_ids:
+                continue
+            if ts and ts >= started_at:
+                new_msgs.append(m)
+            elif not ts:
+                # 没有 timestamp 字段也纳入检查，避免漏码
+                new_msgs.append(m)
+            if msg_id:
+                checked_msg_ids.add(msg_id)
+        if not new_msgs:
+            return None
+        if log_callback:
+            subjects = [str(m.get("subject") or "")[:60] for m in new_msgs]
+            log_callback(
+                f"[Debug] outlookEmailPlus 第{round_no}轮 兜底发现 {len(new_msgs)} 封新邮件: "
+                f"subjects={subjects}"
+            )
+        for m in new_msgs:
+            subject = str(m.get("subject") or "")
+            parts = []
+            for field in ("content", "content_preview", "html_content", "body_preview", "snippet", "text", "raw_content"):
+                value = m.get(field)
+                if isinstance(value, str) and value.strip():
+                    parts.append(value)
+            combined = "\n".join(parts)
+            code = extract_verification_code(combined, subject)
+            if code:
+                if log_callback:
+                    log_callback(
+                        f"[*] outlookEmailPlus 第{round_no}轮 兜底从邮件中提取到验证码: {code} "
+                        f"subject={subject}"
+                    )
+                return code
+        if log_callback:
+            log_callback(
+                f"[Debug] outlookEmailPlus 第{round_no}轮 兜底 {len(new_msgs)} 封新邮件均未提取到验证码"
+            )
+    except Exception as exc:
+        if log_callback:
+            log_callback(
+                f"[Debug] outlookEmailPlus 第{round_no}轮 兜底 messages-list 异常: {exc}"
+            )
+    return None
 
 
 def generate_username(length=10):

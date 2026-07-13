@@ -262,18 +262,22 @@ class outlookEmailPlusVerificationTests(unittest.TestCase):
         self.assertEqual(kwargs["headers"], {"X-API-Key": "api-secret"})
 
     def test_wait_message_404_then_success(self):
-        responses = [
+        # wait-message 第一轮 404，第二轮返回验证码；
+        # 兜底 messages 接口始终返回空列表（不提供新邮件）
+        wait_responses = [
             DummyResponse(status_code=404),
             DummyResponse({
                 "success": True,
                 "data": {"id": "m2", "subject": "Z9Y-8X7 xAI", "content": "code Z9Y-8X7"},
             }),
         ]
-        idx = {"i": 0}
+        widx = {"i": 0}
 
         def fake_get(url, **kwargs):
-            r = responses[idx["i"]]
-            idx["i"] += 1
+            if "/api/external/messages" in url and "/wait-message" not in url:
+                return DummyResponse({"success": True, "data": {"count": 0, "emails": []}})
+            r = wait_responses[widx["i"]]
+            widx["i"] += 1
             return r
 
         # 把 poll sleep 加速
@@ -291,6 +295,8 @@ class outlookEmailPlusVerificationTests(unittest.TestCase):
 
     def test_wait_message_timeout_raises(self):
         def fake_get(url, **kwargs):
+            if "/api/external/messages" in url and "/wait-message" not in url:
+                return DummyResponse({"success": True, "data": {"count": 0, "emails": []}})
             return DummyResponse(status_code=404)
 
         with patch.object(app, "sleep_with_cancel", lambda s, c=None: None), \
@@ -305,6 +311,42 @@ class outlookEmailPlusVerificationTests(unittest.TestCase):
                     resend_callback=None,
                 )
         self.assertIn("outlookEmailPlus", str(ctx.exception))
+
+    def test_fallback_messages_list_catches_email_missed_by_wait_message(self):
+        """wait-message 始终 404，但兜底 messages-list 发现了带验证码的新邮件。"""
+        import time as _time
+        now_ts = _time.time()
+
+        def fake_get(url, **kwargs):
+            if "/wait-message" in url:
+                return DummyResponse(status_code=404)
+            # messages 接口返回一封 timestamp=now 的新邮件
+            return DummyResponse({
+                "success": True,
+                "data": {
+                    "count": 1,
+                    "emails": [
+                        {
+                            "id": "mx1",
+                            "subject": "A1B-2C3 xAI confirmation code",
+                            "content_preview": "your verification code is A1B-2C3",
+                            "timestamp": now_ts,
+                        }
+                    ],
+                },
+            })
+
+        with patch.object(app, "sleep_with_cancel", lambda s, c=None: None), \
+                patch.object(app, "http_get", side_effect=fake_get):
+            code = app.outlook_email_plus_get_oai_code(
+                dev_token="{}",
+                email="verify@b.com",
+                timeout=30,
+                poll_interval=0,
+                cancel_callback=None,
+                resend_callback=None,
+            )
+        self.assertEqual(code, "A1B-2C3")
 
 
 if __name__ == "__main__":
