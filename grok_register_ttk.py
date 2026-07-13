@@ -21,6 +21,12 @@ import random
 import re
 import string
 import json
+import base64
+import select
+import socket
+import socketserver
+import ssl
+import urllib.parse
 
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
@@ -148,11 +154,212 @@ EXTENSION_PATH = os.path.abspath(
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
 
 
+def get_configured_proxy():
+    return str(config.get("proxy", "") or "").strip()
+
+
 def get_proxies():
-    proxy = config.get("proxy", "")
+    proxy = get_configured_proxy()
     if proxy:
         return {"http": proxy, "https": proxy}
     return {}
+
+
+def _parse_proxy_url(proxy):
+    raw = str(proxy or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        return urllib.parse.urlsplit(raw)
+    except Exception:
+        return None
+
+
+def _safe_proxy_port(parsed):
+    try:
+        return parsed.port
+    except Exception:
+        return None
+
+
+def _proxy_has_auth(proxy):
+    parsed = _parse_proxy_url(proxy)
+    return bool(parsed and parsed.hostname and (parsed.username is not None or parsed.password is not None))
+
+
+def _strip_proxy_auth(proxy):
+    raw = str(proxy or "").strip()
+    parsed = _parse_proxy_url(raw)
+    if not parsed or not parsed.hostname:
+        return raw
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    port = _safe_proxy_port(parsed)
+    netloc = f"{host}:{port}" if port else host
+    stripped = urllib.parse.urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
+    if "://" not in raw:
+        return stripped.split("://", 1)[1]
+    return stripped
+
+
+class _ReusableThreadingTCPServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _proxy_recv_until_headers(sock, timeout=20, limit=65536):
+    sock.settimeout(timeout)
+    data = b""
+    while b"\r\n\r\n" not in data and len(data) < limit:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    return data
+
+
+def _proxy_relay(left, right, timeout=60):
+    left.settimeout(timeout)
+    right.settimeout(timeout)
+    sockets = [left, right]
+    while True:
+        readable, _, _ = select.select(sockets, [], [], timeout)
+        if not readable:
+            return
+        for sock in readable:
+            data = sock.recv(65536)
+            if not data:
+                return
+            peer = right if sock is left else left
+            peer.sendall(data)
+
+
+class _LocalAuthProxyBridgeHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        bridge = self.server.bridge
+        upstream = None
+        try:
+            initial = _proxy_recv_until_headers(self.request, timeout=bridge.timeout)
+            if not initial:
+                return
+            first_line = initial.split(b"\r\n", 1)[0].decode("latin1", "ignore")
+            if first_line.upper().startswith("CONNECT "):
+                target = first_line.split()[1]
+                upstream = bridge.open_upstream()
+                req = [f"CONNECT {target} HTTP/1.1", f"Host: {target}"]
+                if bridge.auth_header:
+                    req.append(f"Proxy-Authorization: Basic {bridge.auth_header}")
+                upstream.sendall(("\r\n".join(req) + "\r\n\r\n").encode("latin1"))
+                response = _proxy_recv_until_headers(upstream, timeout=bridge.timeout)
+                if response:
+                    self.request.sendall(response)
+                status = response.split(b"\r\n", 1)[0]
+                if b" 200 " not in status:
+                    return
+                _proxy_relay(self.request, upstream, timeout=bridge.relay_timeout)
+            else:
+                upstream = bridge.open_upstream()
+                upstream.sendall(bridge.inject_proxy_auth(initial))
+                _proxy_relay(self.request, upstream, timeout=bridge.relay_timeout)
+        except Exception:
+            return
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except Exception:
+                    pass
+
+
+class LocalAuthProxyBridge:
+    def __init__(self, proxy_url):
+        parsed = _parse_proxy_url(proxy_url)
+        if not parsed or not parsed.hostname:
+            raise ValueError("认证代理地址格式无效")
+        if (parsed.scheme or "http").lower() not in ("http", "https"):
+            raise ValueError("Chromium 本地认证代理桥仅支持 http/https 上游代理")
+        self.upstream_scheme = (parsed.scheme or "http").lower()
+        self.upstream_host = parsed.hostname
+        self.upstream_port = _safe_proxy_port(parsed) or (443 if self.upstream_scheme == "https" else 80)
+        username = urllib.parse.unquote(parsed.username or "")
+        password = urllib.parse.unquote(parsed.password or "")
+        raw_auth = f"{username}:{password}".encode("utf-8")
+        self.auth_header = base64.b64encode(raw_auth).decode("ascii") if (username or password) else ""
+        self.timeout = 20
+        self.relay_timeout = 90
+        self.server = None
+        self.thread = None
+        self.local_proxy = ""
+
+    def open_upstream(self):
+        sock = socket.create_connection((self.upstream_host, self.upstream_port), timeout=self.timeout)
+        if self.upstream_scheme == "https":
+            context = ssl.create_default_context()
+            sock = context.wrap_socket(sock, server_hostname=self.upstream_host)
+        sock.settimeout(self.timeout)
+        return sock
+
+    def inject_proxy_auth(self, data):
+        if not self.auth_header or b"\r\n\r\n" not in data:
+            return data
+        if b"\r\nproxy-authorization:" in data.lower():
+            return data
+        head, body = data.split(b"\r\n\r\n", 1)
+        auth_line = f"Proxy-Authorization: Basic {self.auth_header}".encode("latin1")
+        return head + b"\r\n" + auth_line + b"\r\n\r\n" + body
+
+    def start(self):
+        self.server = _ReusableThreadingTCPServer(("127.0.0.1", 0), _LocalAuthProxyBridgeHandler)
+        self.server.bridge = self
+        port = self.server.server_address[1]
+        self.local_proxy = f"http://127.0.0.1:{port}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        return self.local_proxy
+
+    def stop(self):
+        if self.server is not None:
+            try:
+                self.server.shutdown()
+                self.server.server_close()
+            except Exception:
+                pass
+        self.server = None
+        self.thread = None
+        self.local_proxy = ""
+
+
+def stop_browser_proxy_bridge():
+    global browser_proxy_bridge
+    if browser_proxy_bridge is not None:
+        try:
+            browser_proxy_bridge.stop()
+        except Exception:
+            pass
+    browser_proxy_bridge = None
+
+
+def prepare_browser_proxy(use_proxy=True, log_callback=None):
+    proxy = get_configured_proxy()
+    if not use_proxy or not proxy:
+        return "", None
+    if _proxy_has_auth(proxy):
+        parsed = _parse_proxy_url(proxy)
+        scheme = (parsed.scheme or "http").lower() if parsed else ""
+        if scheme in ("http", "https"):
+            bridge = LocalAuthProxyBridge(proxy)
+            browser_proxy = bridge.start()
+            if log_callback:
+                log_callback(f"[*] 已为 Chromium 启动本地认证代理桥: {browser_proxy}")
+            return browser_proxy, bridge
+        stripped = _strip_proxy_auth(proxy)
+        if log_callback:
+            log_callback("[!] Chromium 暂不直接支持该认证代理协议，已使用去认证代理地址（无认证）")
+        return stripped, None
+    return proxy, None
 
 
 def get_duckmail_api_key():
@@ -353,10 +560,28 @@ def add_sso_to_cpa(raw_token, email="", log_callback=None):
         _cpa_log(f"直出失败: {exc}")
 
 
-def create_browser_options():
+def apply_browser_proxy_option(options, proxy):
+    if not proxy:
+        return
+    if hasattr(options, "set_proxy"):
+        try:
+            options.set_proxy(proxy)
+            return
+        except Exception:
+            pass
+    if not hasattr(options, "set_argument"):
+        raise AttributeError("当前 DrissionPage ChromiumOptions 不支持设置浏览器代理")
+    try:
+        options.set_argument(f"--proxy-server={proxy}")
+    except TypeError:
+        options.set_argument("--proxy-server", proxy)
+
+
+def create_browser_options(browser_proxy=""):
     options = ChromiumOptions()
     options.auto_port()
     options.set_timeouts(base=1)
+    apply_browser_proxy_option(options, browser_proxy)
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
     return options
@@ -374,28 +599,11 @@ def _build_request_kwargs(**kwargs):
 
 
 def http_get(url, **kwargs):
-    try:
-        return requests.get(url, **_build_request_kwargs(**kwargs))
-    except Exception as exc:
-        err = str(exc)
-        # 代理不可用时自动回退为直连，避免整个流程直接失败
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["proxies"] = {}
-            return requests.get(url, **_build_request_kwargs(**retry_kwargs))
-        raise
+    return requests.get(url, **_build_request_kwargs(**kwargs))
 
 
 def http_post(url, **kwargs):
-    try:
-        return requests.post(url, **_build_request_kwargs(**kwargs))
-    except Exception as exc:
-        err = str(exc)
-        if "127.0.0.1 port 7890" in err or "Could not connect to server" in err:
-            retry_kwargs = dict(kwargs)
-            retry_kwargs["proxies"] = {}
-            return requests.post(url, **_build_request_kwargs(**retry_kwargs))
-        raise
+    return requests.post(url, **_build_request_kwargs(**kwargs))
 
 
 def raise_if_cancelled(cancel_callback=None):
@@ -1709,6 +1917,8 @@ SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 
 browser = None
 page = None
+browser_proxy_bridge = None
+browser_started_with_proxy = False
 
 
 def setup_light_theme(root):
@@ -1812,23 +2022,37 @@ def tk_option_menu(parent, variable, values, width=12):
     return menu
 
 
-def start_browser(log_callback=None):
-    global browser, page
+def start_browser(log_callback=None, use_proxy=True):
+    global browser, page, browser_proxy_bridge, browser_started_with_proxy
     last_exc = None
+    proxy_enabled = bool(use_proxy and get_configured_proxy())
     for attempt in range(1, 5):
+        bridge = None
         try:
-            browser = Chromium(create_browser_options())
+            browser_proxy, bridge = prepare_browser_proxy(use_proxy=use_proxy, log_callback=log_callback)
+            browser = Chromium(create_browser_options(browser_proxy=browser_proxy))
+            browser_proxy_bridge = bridge
+            browser_started_with_proxy = bool(browser_proxy)
             tabs = browser.get_tabs()
             page = tabs[-1] if tabs else browser.new_tab()
             if log_callback and getattr(browser, "user_data_path", None):
                 log_callback(f"[Debug] 当前浏览器资料目录: {browser.user_data_path}")
+            if log_callback and get_configured_proxy():
+                mode = "代理" if browser_started_with_proxy else "直连"
+                log_callback(f"[*] 浏览器网络模式: {mode}")
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
             return browser, page
         except Exception as exc:
             last_exc = exc
+            if bridge is not None:
+                try:
+                    bridge.stop()
+                except Exception:
+                    pass
             if log_callback:
-                log_callback(f"[Debug] 浏览器启动失败(第{attempt}/4次): {exc}")
+                mode = "代理" if proxy_enabled else "直连"
+                log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
@@ -1836,27 +2060,30 @@ def start_browser(log_callback=None):
                 pass
             browser = None
             page = None
+            browser_proxy_bridge = None
+            browser_started_with_proxy = False
             time.sleep(min(1.5 * attempt, 4))
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
 def stop_browser():
-    global browser, page
+    global browser, page, browser_started_with_proxy
     current = browser
     browser = None
     page = None
-    if current is None:
-        return
-    try:
-        current.quit(del_data=True)
-    except BaseException:
-        # KeyboardInterrupt 继承 BaseException，清理阶段必须吞掉，避免 Ctrl+C 刷 traceback
-        pass
+    browser_started_with_proxy = False
+    if current is not None:
+        try:
+            current.quit(del_data=True)
+        except BaseException:
+            # KeyboardInterrupt 继承 BaseException，清理阶段必须吞掉，避免 Ctrl+C 刷 traceback
+            pass
+    stop_browser_proxy_bridge()
 
 
-def restart_browser(log_callback=None):
+def restart_browser(log_callback=None, use_proxy=True):
     stop_browser()
-    return start_browser(log_callback=log_callback)
+    return start_browser(log_callback=log_callback, use_proxy=use_proxy)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
