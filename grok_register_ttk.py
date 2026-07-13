@@ -3719,6 +3719,133 @@ def _cli_test_outlook_email_plus():
     cli_log("[*] outlookEmailPlus 自检通过：health / capabilities / claim-random / claim-release 全部可用")
 
 
+def _cli_test_cpa():
+    """自检 CLIProxyAPI(CPA) 入库链路：本地 auth 目录 + 远程 Management API。
+
+    本地：cpa_auth_dir 存在且可写（写一个 .probe 文件再删除，不产生 auth 文件）
+    远程：GET /v0/management/config 验证 base + management_key 可用；
+          GET /v0/management/auth-files 列出当前 auth 文件，统计 xai-*.json 数量。
+    任一已配置的目标失败即判失败；未配置的目标跳过。
+    """
+    load_config()
+    cli_log("[*] 自检 CLIProxyAPI(CPA) 入库链路...")
+
+    auth_dir = str(config.get("cpa_auth_dir", "") or "").strip()
+    remote_url = str(config.get("cpa_remote_url", "") or "").strip().rstrip("/")
+    management_key = str(config.get("cpa_management_key", "") or "").strip()
+    auto_add = bool(config.get("cpa_auto_add", False))
+
+    cli_log(f"[*] cpa_auto_add={auto_add}  本地目录={'已配置' if auth_dir else '未配置'}  远程={'已配置' if remote_url else '未配置'}")
+
+    if not auto_add:
+        cli_log("[~] cpa_auto_add 未开启；仅检测已配置的目标，不强制要求")
+
+    any_configured = False
+    all_ok = True
+
+    # 1. 本地 auth 目录
+    if auth_dir:
+        any_configured = True
+        cli_log(f"[*] 本地 auth 目录: {auth_dir}")
+        try:
+            import os as _os
+            if not _os.path.isdir(auth_dir):
+                cli_log(f"[!] 本地目录不存在: {auth_dir}")
+                all_ok = False
+            else:
+                probe = _os.path.join(auth_dir, ".cpa_probe")
+                try:
+                    with open(probe, "w", encoding="utf-8") as f:
+                        f.write("probe")
+                    _os.remove(probe)
+                    cli_log(f"[+] 本地目录可写: {auth_dir}")
+                except Exception as w_exc:
+                    cli_log(f"[!] 本地目录不可写: {w_exc}")
+                    all_ok = False
+        except Exception as exc:
+            cli_log(f"[!] 本地目录检测异常: {exc}")
+            all_ok = False
+    else:
+        cli_log("[~] 未配置 cpa_auth_dir，跳过本地目录检测")
+
+    # 2. 远程 Management API
+    if remote_url:
+        any_configured = True
+        if not management_key:
+            cli_log("[!] 已配置 cpa_remote_url 但未配置 cpa_management_key，无法自检远程")
+            all_ok = False
+        else:
+            cli_log(f"[*] 远程 CPA: {remote_url}")
+            headers = {"Authorization": f"Bearer {management_key}"}
+
+            # 2a. GET /v0/management/config — 验证连通性与密钥
+            try:
+                resp = http_get(
+                    f"{remote_url}/v0/management/config",
+                    headers=headers,
+                    timeout=20,
+                )
+                if resp.status_code == 401 or resp.status_code == 403:
+                    cli_log(f"[!] 远程管理密钥无效 HTTP {resp.status_code}（401/403 鉴权失败）")
+                    all_ok = False
+                elif resp.status_code == 404:
+                    cli_log(f"[!] 远程 Management API 返回 404（未启用远程管理或 base 路径错误）")
+                    all_ok = False
+                elif not (200 <= resp.status_code < 300):
+                    cli_log(f"[!] GET /config 失败 HTTP {resp.status_code}  body={response_preview(resp)}")
+                    all_ok = False
+                else:
+                    try:
+                        cfg = resp.json()
+                    except Exception:
+                        cfg = {}
+                    auth_dir_remote = cfg.get("auth-dir") or cfg.get("auth_dir") or "?"
+                    cli_log(f"[+] GET /config 成功  HTTP {resp.status_code}  auth-dir={auth_dir_remote}")
+            except Exception as exc:
+                cli_log(f"[!] GET /config 请求异常: {exc}")
+                all_ok = False
+
+            # 2b. GET /v0/management/auth-files — 列出 auth 文件，统计 xai-*.json
+            if all_ok:
+                try:
+                    resp = http_get(
+                        f"{remote_url}/v0/management/auth-files",
+                        headers=headers,
+                        timeout=20,
+                    )
+                    if not (200 <= resp.status_code < 300):
+                        cli_log(f"[!] GET /auth-files 失败 HTTP {resp.status_code}  body={response_preview(resp)}")
+                        all_ok = False
+                    else:
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            data = {}
+                        files = data.get("files") or []
+                        total = len(files)
+                        xai_files = [f for f in files if str(f.get("name") or "").startswith("xai-")]
+                        xai_count = len(xai_files)
+                        cli_log(f"[+] GET /auth-files 成功  HTTP {resp.status_code}  auth 文件总数={total}  xai-*.json={xai_count}")
+                        if xai_count > 0:
+                            for f in xai_files[:5]:
+                                cli_log(f"    - {f.get('name')}  provider={f.get('provider') or '?'}  status={f.get('status') or '?'}")
+                            if xai_count > 5:
+                                cli_log(f"    ... 其余 {xai_count - 5} 个 xai 文件未显示")
+                except Exception as exc:
+                    cli_log(f"[!] GET /auth-files 请求异常: {exc}")
+                    all_ok = False
+    else:
+        cli_log("[~] 未配置 cpa_remote_url，跳过远程 Management API 检测")
+
+    if not any_configured:
+        cli_log("[!] 未配置任何 CPA 入库目标（cpa_auth_dir / cpa_remote_url 均为空）")
+        sys.exit(1)
+    if not all_ok:
+        cli_log("[!] CPA 自检未通过")
+        sys.exit(1)
+    cli_log("[*] CPA 自检通过：已配置的入库目标均可用")
+
+
 def main_cli():
     load_config()
     count = int(config.get("register_count", 1) or 1)
@@ -3750,12 +3877,16 @@ def main():
         if cmd in ("test-outlook-email-plus", "test-oep", "--test-outlook-email-plus"):
             _cli_test_outlook_email_plus()
             return
+        if cmd in ("test-cpa", "--test-cpa"):
+            _cli_test_cpa()
+            return
         if cmd in ("-h", "--help", "help"):
             print(
                 "用法:\n"
                 "  python grok_register_ttk.py                          启动 GUI\n"
                 "  python grok_register_ttk.py cli                      交互式 CLI 注册\n"
                 "  python grok_register_ttk.py test-outlook-email-plus  自检 outlookEmailPlus 池读写\n"
+                "  python grok_register_ttk.py test-cpa                 自检 CPA 入库链路（本地目录 + 远程 Management API）\n"
                 "  python grok_register_ttk.py -h|--help                显示本帮助\n"
             )
             return
