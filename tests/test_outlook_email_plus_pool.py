@@ -348,6 +348,120 @@ class outlookEmailPlusVerificationTests(unittest.TestCase):
             )
         self.assertEqual(code, "A1B-2C3")
 
+    def test_consecutive_upstream_502_fails_fast(self):
+        """连续 HTTP 502 / UPSTREAM_READ_FAILED 应快速失败，而不是空转到 timeout。"""
+        gets = []
+
+        def fake_get(url, **kwargs):
+            gets.append(url)
+            return DummyResponse(
+                {
+                    "success": False,
+                    "code": "UPSTREAM_READ_FAILED",
+                    "message": "Graph/IMAP 均读取失败",
+                },
+                status_code=502,
+            )
+
+        with patch.object(app, "sleep_with_cancel", lambda s, c=None: None), \
+                patch.object(app, "http_get", side_effect=fake_get):
+            with self.assertRaises(Exception) as ctx:
+                app.outlook_email_plus_get_oai_code(
+                    dev_token="{}",
+                    email="verify@b.com",
+                    timeout=180,
+                    poll_interval=0,
+                    cancel_callback=None,
+                    resend_callback=None,
+                    max_upstream_failures=3,
+                )
+        self.assertIn("上游连续失败", str(ctx.exception))
+        self.assertIn("UPSTREAM_READ_FAILED", str(ctx.exception))
+        # 只打 wait-message，不反复打兜底 messages-list
+        self.assertEqual(len(gets), 3)
+        self.assertTrue(all("/wait-message" in u for u in gets))
+
+    def test_upstream_failure_skips_resend_callback(self):
+        """上游连续失败期间不应触发页面端重新发送验证码。"""
+        resend_calls = []
+        t = {"now": 1000.0}
+
+        def fake_time():
+            return t["now"]
+
+        def fake_get(url, **kwargs):
+            # 每轮推进时间，确保会命中 next_resend_at
+            t["now"] += 40
+            return DummyResponse(
+                {
+                    "success": False,
+                    "code": "UPSTREAM_READ_FAILED",
+                    "message": "Graph/IMAP 均读取失败",
+                },
+                status_code=502,
+            )
+
+        with patch.object(app.time, "time", side_effect=fake_time), \
+                patch.object(app, "sleep_with_cancel", lambda s, c=None: None), \
+                patch.object(app, "http_get", side_effect=fake_get):
+            with self.assertRaises(Exception) as ctx:
+                app.outlook_email_plus_get_oai_code(
+                    dev_token="{}",
+                    email="verify@b.com",
+                    timeout=180,
+                    poll_interval=0,
+                    cancel_callback=None,
+                    resend_callback=lambda: resend_calls.append(1),
+                    max_upstream_failures=3,
+                )
+        self.assertIn("上游连续失败", str(ctx.exception))
+        self.assertEqual(resend_calls, [])
+
+    def test_upstream_failure_resets_after_404(self):
+        """偶发上游失败后若恢复为 404/正常等待，计数应清零并继续轮询。"""
+        wait_responses = [
+            DummyResponse(
+                {
+                    "success": False,
+                    "code": "UPSTREAM_READ_FAILED",
+                    "message": "temporary",
+                },
+                status_code=502,
+            ),
+            DummyResponse(status_code=404),
+            DummyResponse(
+                {
+                    "success": True,
+                    "data": {
+                        "id": "m3",
+                        "subject": "Q1W-2E3 xAI",
+                        "content": "code Q1W-2E3",
+                    },
+                }
+            ),
+        ]
+        widx = {"i": 0}
+
+        def fake_get(url, **kwargs):
+            if "/api/external/messages" in url and "/wait-message" not in url:
+                return DummyResponse({"success": True, "data": {"count": 0, "emails": []}})
+            r = wait_responses[widx["i"]]
+            widx["i"] += 1
+            return r
+
+        with patch.object(app, "sleep_with_cancel", lambda s, c=None: None), \
+                patch.object(app, "http_get", side_effect=fake_get):
+            code = app.outlook_email_plus_get_oai_code(
+                dev_token="{}",
+                email="verify@b.com",
+                timeout=30,
+                poll_interval=0,
+                cancel_callback=None,
+                resend_callback=None,
+                max_upstream_failures=3,
+            )
+        self.assertEqual(code, "Q1W-2E3")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1155,6 +1155,7 @@ def outlook_email_plus_get_oai_code(
     log_callback=None,
     cancel_callback=None,
     resend_callback=None,
+    max_upstream_failures=3,
 ):
     """通过 outlookEmailPlus 的 wait-message 接口等待新邮件并提取验证码。
 
@@ -1165,6 +1166,9 @@ def outlook_email_plus_get_oai_code(
     之间的空隙到达，会永远错过。因此每轮 wait-message 返回 404 后，
     再用 GET /api/external/messages 拉取该邮箱的邮件列表，检查是否有
     timestamp >= started_at 的新邮件，有则提取验证码。
+
+    上游故障：HTTP 5xx / UPSTREAM_* 连续失败达到 max_upstream_failures
+    时快速失败，避免在 Graph/IMAP 已挂时空转满 timeout，并跳过重发验证码。
     """
     api_base = get_outlook_email_plus_api_base()
     if not api_base:
@@ -1176,28 +1180,67 @@ def outlook_email_plus_get_oai_code(
     wait_seconds = 25
     round_no = 0
     checked_msg_ids = set()  # 已通过兜底检查过的 message ID
+    consecutive_upstream_failures = 0
+    last_upstream_error = ""
+
+    def _is_upstream_error_code(code):
+        code = str(code or "").upper()
+        return code.startswith("UPSTREAM") or code in (
+            "UPSTREAM_READ_FAILED",
+            "GRAPH_FAILED",
+            "IMAP_FAILED",
+        )
+
+    def _note_upstream_failure(reason):
+        nonlocal consecutive_upstream_failures, last_upstream_error
+        consecutive_upstream_failures += 1
+        last_upstream_error = str(reason or "UPSTREAM_ERROR")
+        if log_callback:
+            log_callback(
+                f"[Debug] outlookEmailPlus 第{round_no}轮 上游失败 "
+                f"({consecutive_upstream_failures}/{max_upstream_failures}): {last_upstream_error}"
+            )
+        if consecutive_upstream_failures >= max_upstream_failures:
+            raise Exception(
+                f"outlookEmailPlus 上游连续失败 {consecutive_upstream_failures} 次: {last_upstream_error}"
+            )
+
+    def _clear_upstream_failures():
+        nonlocal consecutive_upstream_failures, last_upstream_error
+        consecutive_upstream_failures = 0
+        last_upstream_error = ""
+
     if log_callback:
         log_callback(
             f"[Debug] outlookEmailPlus 拉取验证码开始: email={email} "
             f"timeout={timeout}s wait_seconds={wait_seconds} poll_interval={poll_interval}s "
-            f"api_base={api_base}"
+            f"max_upstream_failures={max_upstream_failures} api_base={api_base}"
         )
     while time.time() < deadline:
         round_no += 1
         remaining = int(deadline - time.time())
         raise_if_cancelled(cancel_callback)
         # 在每一轮等待前触发重新发送验证码（页面端逻辑），与其它 provider 保持一致节奏
+        # 上游读邮箱已失败时重发无意义，且会浪费验证码次数
         if resend_callback and time.time() >= next_resend_at:
-            if log_callback:
-                log_callback(f"[Debug] outlookEmailPlus 第{round_no}轮 触发重新发送验证码")
-            try:
-                resend_callback()
+            if consecutive_upstream_failures > 0:
                 if log_callback:
-                    log_callback(f"[*] outlookEmailPlus 第{round_no}轮 已触发重新发送验证码")
-            except Exception as exc:
+                    log_callback(
+                        f"[Debug] outlookEmailPlus 第{round_no}轮 上游连续失败 "
+                        f"{consecutive_upstream_failures} 次，跳过重新发送验证码"
+                    )
+                next_resend_at = time.time() + 35
+            else:
                 if log_callback:
-                    log_callback(f"[Debug] outlookEmailPlus 第{round_no}轮 触发重发验证码失败: {exc}")
-            next_resend_at = time.time() + 35
+                    log_callback(f"[Debug] outlookEmailPlus 第{round_no}轮 触发重新发送验证码")
+                try:
+                    resend_callback()
+                    if log_callback:
+                        log_callback(f"[*] outlookEmailPlus 第{round_no}轮 已触发重新发送验证码")
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] outlookEmailPlus 第{round_no}轮 触发重发验证码失败: {exc}")
+                next_resend_at = time.time() + 35
 
         # 若本次领取已被外部 release/complete，则停止轮询
         if _outlook_email_plus_pending_claim is None and dev_token:
@@ -1231,6 +1274,7 @@ def outlook_email_plus_get_oai_code(
                 log_callback(
                     f"[Debug] outlookEmailPlus 第{round_no}轮 wait-message 请求异常: {exc}"
                 )
+            _note_upstream_failure(f"request_error: {exc}")
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
 
@@ -1241,6 +1285,7 @@ def outlook_email_plus_get_oai_code(
             )
         if resp.status_code == 404:
             # 服务端本轮未等到新邮件；用 message-list 兜底检查
+            _clear_upstream_failures()
             fallback_code = _outlook_email_plus_fallback_list_messages(
                 email, started_at, headers, round_no, checked_msg_ids, log_callback
             )
@@ -1252,9 +1297,29 @@ def outlook_email_plus_get_oai_code(
                 )
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
+
+        data = None
         try:
             data = resp.json()
         except Exception:
+            data = None
+
+        if resp.status_code >= 500:
+            reason = f"HTTP {resp.status_code}"
+            if isinstance(data, dict):
+                code = str(data.get("code") or "")
+                msg = data.get("message")
+                if code or msg:
+                    reason = f"{code or reason} {msg or ''}".strip()
+            if log_callback:
+                log_callback(
+                    f"[Debug] outlookEmailPlus 第{round_no}轮 wait-message 失败: {reason}"
+                )
+            _note_upstream_failure(reason)
+            sleep_with_cancel(poll_interval, cancel_callback)
+            continue
+
+        if data is None:
             if log_callback:
                 log_callback(
                     f"[Debug] outlookEmailPlus 第{round_no}轮 wait-message 非JSON: {response_preview(resp)}"
@@ -1275,7 +1340,12 @@ def outlook_email_plus_get_oai_code(
                 log_callback(
                     f"[Debug] outlookEmailPlus 第{round_no}轮 wait-message 失败: {code} {data.get('message')}"
                 )
-            # 非 404 的失败也走兜底
+            if _is_upstream_error_code(code):
+                _note_upstream_failure(f"{code} {data.get('message') or ''}".strip())
+                sleep_with_cancel(poll_interval, cancel_callback)
+                continue
+            # 非上游类失败仍走兜底
+            _clear_upstream_failures()
             fallback_code = _outlook_email_plus_fallback_list_messages(
                 email, started_at, headers, round_no, checked_msg_ids, log_callback
             )
@@ -1284,6 +1354,7 @@ def outlook_email_plus_get_oai_code(
             sleep_with_cancel(poll_interval, cancel_callback)
             continue
 
+        _clear_upstream_failures()
         msg = data.get("data") or {}
         subject = str(msg.get("subject") or "")
         msg_id = msg.get("id") or msg.get("messageId") or msg.get("uid") or ""
