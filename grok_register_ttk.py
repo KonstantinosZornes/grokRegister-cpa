@@ -332,14 +332,18 @@ class LocalAuthProxyBridge:
         self.local_proxy = ""
 
 
-def stop_browser_proxy_bridge():
+def stop_browser_proxy_bridge(log_callback=None):
     global browser_proxy_bridge
-    if browser_proxy_bridge is not None:
-        try:
-            browser_proxy_bridge.stop()
-        except Exception:
-            pass
+    bridge = browser_proxy_bridge
     browser_proxy_bridge = None
+    if bridge is None:
+        return
+    try:
+        bridge.stop()
+    except Exception as exc:
+        if log_callback:
+            log_callback(f"[!] 关闭浏览器代理桥失败: {exc}")
+        raise
 
 
 def prepare_browser_proxy(use_proxy=True, log_callback=None):
@@ -2147,16 +2151,18 @@ def start_browser(log_callback=None, use_proxy=True):
             if bridge is not None:
                 try:
                     bridge.stop()
-                except Exception:
-                    pass
+                except Exception as bridge_exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 启动失败后关闭代理桥异常: {bridge_exc}")
             if log_callback:
                 mode = "代理" if proxy_enabled else "直连"
                 log_callback(f"[Debug] 浏览器{mode}启动失败(第{attempt}/4次): {exc}")
             try:
                 if browser is not None:
                     browser.quit(del_data=True)
-            except Exception:
-                pass
+            except Exception as quit_exc:
+                if log_callback:
+                    log_callback(f"[Debug] 启动失败后关闭浏览器异常: {quit_exc}")
             browser = None
             page = None
             browser_proxy_bridge = None
@@ -2165,40 +2171,40 @@ def start_browser(log_callback=None, use_proxy=True):
     raise Exception(f"浏览器启动失败，已重试4次: {last_exc}")
 
 
-def stop_browser():
+def stop_browser(log_callback=None):
     global browser, page, browser_started_with_proxy
     current = browser
     browser = None
     page = None
     browser_started_with_proxy = False
+    errors = []
     if current is not None:
         try:
             current.quit(del_data=True)
-        except BaseException:
-            # KeyboardInterrupt 继承 BaseException，清理阶段必须吞掉，避免 Ctrl+C 刷 traceback
-            pass
-    stop_browser_proxy_bridge()
+        except Exception as exc:
+            errors.append(exc)
+            if log_callback:
+                log_callback(f"[!] 关闭浏览器失败: {exc}")
+    try:
+        stop_browser_proxy_bridge(log_callback=log_callback)
+    except Exception as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 def restart_browser(log_callback=None, use_proxy=True):
-    stop_browser()
+    stop_browser(log_callback=log_callback)
     return start_browser(log_callback=log_callback, use_proxy=use_proxy)
 
 
 def cleanup_runtime_memory(log_callback=None, reason="定期清理"):
-    try:
-        if log_callback:
-            log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
-        stop_browser()
-        collected = gc.collect()
-        if log_callback:
-            log_callback(f"[*] Python GC 已回收对象数: {collected}")
-    except BaseException:
-        # 退出清理中再收到 Ctrl+C 时静默结束，不向外抛
-        try:
-            stop_browser()
-        except BaseException:
-            pass
+    if log_callback:
+        log_callback(f"[*] {reason}: 关闭浏览器并清理内存")
+    stop_browser(log_callback=log_callback)
+    collected = gc.collect()
+    if log_callback:
+        log_callback(f"[*] Python GC 已回收对象数: {collected}")
 
 
 def refresh_active_page():
@@ -4008,9 +4014,9 @@ class GrokRegisterGUI:
         finally:
             release_email_provider_claim("registration_stopped", log_callback=self.log)
             try:
-                stop_browser()
-            except BaseException:
-                pass
+                stop_browser(log_callback=self.log)
+            except Exception as stop_exc:
+                self.log(f"[!] 任务结束关闭浏览器失败: {stop_exc}")
             self._set_running_ui(False)
             self.log("[*] 任务结束")
 
@@ -4210,12 +4216,9 @@ def run_registration_cli(count):
             pass
         try:
             cleanup_runtime_memory(log_callback=cli_log, reason="任务结束")
-        except BaseException:
-            pass
-        try:
-            cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
-        except BaseException:
-            pass
+        except Exception as cleanup_exc:
+            cli_log(f"[!] 任务结束清理失败: {cleanup_exc}")
+        cli_log(f"[*] 任务结束。成功 {success_count} | 失败 {fail_count}")
         try:
             signal.signal(signal.SIGINT, _prev_sigint)
         except Exception:
