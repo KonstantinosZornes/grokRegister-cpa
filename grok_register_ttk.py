@@ -3986,19 +3986,21 @@ class GrokRegisterGUI:
                     self.update_stats()
                     if self.should_stop():
                         break
-                    try:
-                        if browser is None:
-                            start_browser(log_callback=self.log)
-                        else:
-                            restart_browser(log_callback=self.log)
-                        # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                        time.sleep(1)
-                    except RegistrationCancelled:
-                        break
-                    except Exception as restart_exc:
-                        if self.should_stop():
+                    # 仅还有下一号时重启；最后一轮留给外层 stop_browser，避免闪一下再关
+                    if i < count:
+                        try:
+                            if browser is None:
+                                start_browser(log_callback=self.log)
+                            else:
+                                restart_browser(log_callback=self.log)
+                            # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
+                            time.sleep(1)
+                        except RegistrationCancelled:
                             break
-                        self.log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                        except Exception as restart_exc:
+                            if self.should_stop():
+                                break
+                            self.log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
         except RegistrationCancelled:
             self.log("[!] 注册被用户停止")
         except Exception as exc:
@@ -4174,23 +4176,25 @@ def run_registration_cli(count):
             finally:
                 if controller.should_stop():
                     break
-                try:
-                    if browser is None:
-                        start_browser(log_callback=cli_log)
-                    else:
-                        restart_browser(log_callback=cli_log)
-                    # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
-                    time.sleep(1)
-                except KeyboardInterrupt:
-                    controller.stop()
-                    cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
-                    break
-                except RegistrationCancelled:
-                    break
-                except Exception as restart_exc:
-                    if controller.should_stop():
+                # 仅还有下一号时重启；最后一轮留给外层 stop_browser，避免闪一下再关
+                if i < count:
+                    try:
+                        if browser is None:
+                            start_browser(log_callback=cli_log)
+                        else:
+                            restart_browser(log_callback=cli_log)
+                        # 停止后不再调用 cancel_callback，避免 finally 里二次抛出 RegistrationCancelled
+                        time.sleep(1)
+                    except KeyboardInterrupt:
+                        controller.stop()
+                        cli_log("[!] 收到 Ctrl+C，正在停止（再按一次强制中断）")
                         break
-                    cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
+                    except RegistrationCancelled:
+                        break
+                    except Exception as restart_exc:
+                        if controller.should_stop():
+                            break
+                        cli_log(f"[Debug] 轮次清理/重启浏览器失败: {restart_exc}")
     except KeyboardInterrupt:
         controller.stop()
         cli_log("[!] 收到 Ctrl+C，正在停止并清理")
